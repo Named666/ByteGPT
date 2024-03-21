@@ -1,2 +1,2 @@
-# SmallGPT
-A Small GPT example using character-level encoding/decoding. 256 tokens by default - scales with the unicode charset.
+# ByteGPT
+A small GPT example using byte level encoding/decoding.
