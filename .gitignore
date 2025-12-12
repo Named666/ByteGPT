@@ -1,1 +1,4 @@
 data/model.pt
+__pycache__/
+*.pyc
+*.pyo
