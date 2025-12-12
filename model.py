@@ -446,6 +446,22 @@ class MLA(nn.Module):
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
+    def _apply_per_head_norm(self, kv: torch.Tensor) -> torch.Tensor:
+        """
+        Apply per-head normalization to the latent key-value tensor.
+        
+        Args:
+            kv: Tensor of shape (batch_size, seq_len, n_local_heads, kv_lora_rank)
+        
+        Returns:
+            Normalized tensor of the same shape
+        """
+        # Create normalized tensor (can't do in-place due to view restrictions)
+        kv_list = []
+        for h in range(self.n_local_heads):
+            kv_list.append(self.kv_norm[h](kv[:, :, h]))
+        return torch.stack(kv_list, dim=2)
+
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         """
         Forward pass for the Multi-Headed Latent Attention Layer (MLA).
@@ -477,13 +493,10 @@ class MLA(nn.Module):
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
-            # Apply per-head normalization using vectorized operations
-            # Shape: (bsz, seqlen, n_local_heads, kv_lora_rank)
-            kv_normed = kv.clone()
-            for h in range(self.n_local_heads):
-                kv_normed[:, :, h] = self.kv_norm[h](kv[:, :, h])
-            kv_normed = kv_normed.view(bsz, seqlen, -1)
-            kv = self.wkv_b(kv_normed)
+            # Apply per-head normalization
+            kv = self._apply_per_head_norm(kv)
+            kv = kv.view(bsz, seqlen, -1)
+            kv = self.wkv_b(kv)
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
@@ -494,31 +507,32 @@ class MLA(nn.Module):
             scores = torch.einsum("bshd,bthd->bsht", q, k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            # wkv_b shape: (n_local_heads * (qk_nope_head_dim + v_head_dim), n_heads * kv_lora_rank)
-            # Reshape to access per-head weights
-            # First reshape to separate output heads and input latent dimensions
+            # Reshape wkv_b weight for per-head latent attention:
+            # Original shape: (n_local_heads * (qk_nope_head_dim + v_head_dim), n_heads * kv_lora_rank)
+            # This contains weights for all heads, but we only need weights for our local heads
+            # Step 1: Reshape to separate dimensions
+            # Shape becomes: (n_local_heads, qk_nope_head_dim + v_head_dim, n_heads, kv_lora_rank)
             wkv_b = wkv_b.view(self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim, self.n_heads, self.kv_lora_rank)
-            # Select only the weights corresponding to each local head's latent space
-            # Each local head h should use latent space from global head (rank * n_local_heads + h)
+            # Step 2: Extract weights for each local head's corresponding global latent space
+            # Each local head h (0 to n_local_heads-1) corresponds to global head (rank * n_local_heads + h)
+            # We extract the weight slice that connects local head h to its global latent space
             wkv_b_per_head = []
             for h in range(self.n_local_heads):
                 global_head_idx = rank * self.n_local_heads + h
                 wkv_b_per_head.append(wkv_b[h, :, global_head_idx, :])
-            wkv_b = torch.stack(wkv_b_per_head, dim=0)  # (n_local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
-            # wkv_b is now (n_local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
-            # We need (n_local_heads, kv_lora_rank, qk_nope_head_dim + v_head_dim) for the einsum to work
-            # But for q_nope computation, we use: q_nope (bsz, seqlen, n_heads, qk_nope_head_dim) @ wkv_b_k (n_heads, qk_nope_head_dim, kv_lora_rank)
-            # So we need to transpose the relevant slice
-            wkv_b_k = wkv_b[:, :self.qk_nope_head_dim, :].transpose(1, 2)  # (n_local_heads, kv_lora_rank, qk_nope_head_dim)
-            wkv_b_v = wkv_b[:, -self.v_head_dim:, :].transpose(1, 2)  # (n_local_heads, kv_lora_rank, v_head_dim)
+            # Shape after stack: (n_local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+            wkv_b = torch.stack(wkv_b_per_head, dim=0)
+            # Step 3: Split and transpose for key and value projections
+            # For keys: need (n_local_heads, kv_lora_rank, qk_nope_head_dim) for einsum "bshd,hcd->bshc"
+            # For values: need (n_local_heads, kv_lora_rank, v_head_dim) for einsum "bshc,hcd->bshd"
+            wkv_b_k = wkv_b[:, :self.qk_nope_head_dim, :].transpose(1, 2)
+            wkv_b_v = wkv_b[:, -self.v_head_dim:, :].transpose(1, 2)
             q_nope = torch.einsum("bshd,hcd->bshc", q_nope, wkv_b_k)
             kv_cache = self.kv_cache.clone()
             pe_cache = self.pe_cache.clone()
             # Apply per-head normalization before caching
-            kv_normed = kv.clone()
-            for h in range(self.n_local_heads):
-                kv_normed[:, :, h] = self.kv_norm[h](kv[:, :, h])
-            kv_cache[:bsz, start_pos:end_pos] = kv_normed
+            kv = self._apply_per_head_norm(kv)
+            kv_cache[:bsz, start_pos:end_pos] = kv
             pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             scores = (torch.einsum("bshc,bthc->bsht", q_nope, kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, pe_cache[:bsz, :end_pos])) * self.softmax_scale
