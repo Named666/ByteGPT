@@ -477,8 +477,11 @@ class MLA(nn.Module):
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
-            # Apply per-head normalization
-            kv_normed = torch.stack([self.kv_norm[h](kv[:, :, h]) for h in range(self.n_local_heads)], dim=2)
+            # Apply per-head normalization using vectorized operations
+            # Shape: (bsz, seqlen, n_local_heads, kv_lora_rank)
+            kv_normed = kv.clone()
+            for h in range(self.n_local_heads):
+                kv_normed[:, :, h] = self.kv_norm[h](kv[:, :, h])
             kv_normed = kv_normed.view(bsz, seqlen, -1)
             kv = self.wkv_b(kv_normed)
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -491,15 +494,30 @@ class MLA(nn.Module):
             scores = torch.einsum("bshd,bthd->bsht", q, k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.n_heads * self.kv_lora_rank)
-            # Extract weight for each local head's latent dimension
-            wkv_b = wkv_b[:, :, rank * self.n_local_heads * self.kv_lora_rank:(rank + 1) * self.n_local_heads * self.kv_lora_rank]
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            # wkv_b shape: (n_local_heads * (qk_nope_head_dim + v_head_dim), n_heads * kv_lora_rank)
+            # Reshape to access per-head weights
+            # First reshape to separate output heads and input latent dimensions
+            wkv_b = wkv_b.view(self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim, self.n_heads, self.kv_lora_rank)
+            # Select only the weights corresponding to each local head's latent space
+            # Each local head h should use latent space from global head (rank * n_local_heads + h)
+            wkv_b_per_head = []
+            for h in range(self.n_local_heads):
+                global_head_idx = rank * self.n_local_heads + h
+                wkv_b_per_head.append(wkv_b[h, :, global_head_idx, :])
+            wkv_b = torch.stack(wkv_b_per_head, dim=0)  # (n_local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+            # wkv_b is now (n_local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+            # We need (n_local_heads, kv_lora_rank, qk_nope_head_dim + v_head_dim) for the einsum to work
+            # But for q_nope computation, we use: q_nope (bsz, seqlen, n_heads, qk_nope_head_dim) @ wkv_b_k (n_heads, qk_nope_head_dim, kv_lora_rank)
+            # So we need to transpose the relevant slice
+            wkv_b_k = wkv_b[:, :self.qk_nope_head_dim, :].transpose(1, 2)  # (n_local_heads, kv_lora_rank, qk_nope_head_dim)
+            wkv_b_v = wkv_b[:, -self.v_head_dim:, :].transpose(1, 2)  # (n_local_heads, kv_lora_rank, v_head_dim)
+            q_nope = torch.einsum("bshd,hcd->bshc", q_nope, wkv_b_k)
             kv_cache = self.kv_cache.clone()
             pe_cache = self.pe_cache.clone()
             # Apply per-head normalization before caching
-            kv_normed = torch.stack([self.kv_norm[h](kv[:, :, h]) for h in range(self.n_local_heads)], dim=2)
+            kv_normed = kv.clone()
+            for h in range(self.n_local_heads):
+                kv_normed[:, :, h] = self.kv_norm[h](kv[:, :, h])
             kv_cache[:bsz, start_pos:end_pos] = kv_normed
             pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             scores = (torch.einsum("bshc,bthc->bsht", q_nope, kv_cache[:bsz, :end_pos]) +
@@ -511,7 +529,7 @@ class MLA(nn.Module):
             x = torch.einsum("bsht,bthd->bshd", scores, v_cache[:bsz, :end_pos])
         else:
             x = torch.einsum("bsht,bthc->bshc", scores, kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+            x = torch.einsum("bshc,hcd->bshd", x, wkv_b_v)
         x = self.wo(x.flatten(2))
         return x
 
