@@ -397,14 +397,14 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 class MLA(nn.Module):
     """
-    Multi-Headed Attention Layer (MLA).
+    Multi-Headed Latent Attention Layer (MLA) inspired by DeepSeek.
 
     Attributes:
         dim (int): Dimensionality of the input features.
         n_heads (int): Number of attention heads.
         n_local_heads (int): Number of local attention heads for distributed systems.
         q_lora_rank (int): Rank for low-rank query projection.
-        kv_lora_rank (int): Rank for low-rank key/value projection.
+        kv_lora_rank (int): Rank for low-rank key/value projection per head.
         qk_nope_head_dim (int): Dimensionality of non-positional query/key projections.
         qk_rope_head_dim (int): Dimensionality of rotary-positional query/key projections.
         qk_head_dim (int): Total dimensionality of query/key projections.
@@ -429,9 +429,10 @@ class MLA(nn.Module):
             self.wq_a = Linear(self.dim, self.q_lora_rank)
             self.q_norm = RMSNorm(self.q_lora_rank)
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
-        self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+        # Multi-head latent attention: each head has its own latent compression
+        self.wkv_a = Linear(self.dim, self.n_heads * self.kv_lora_rank + self.qk_rope_head_dim)
+        self.kv_norm = nn.ModuleList([RMSNorm(self.kv_lora_rank) for _ in range(self.n_local_heads)])
+        self.wkv_b = ColumnParallelLinear(self.n_heads * self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
@@ -442,12 +443,12 @@ class MLA(nn.Module):
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
         else:
-            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
+            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         """
-        Forward pass for the Multi-Headed Attention Layer (MLA).
+        Forward pass for the Multi-Headed Latent Attention Layer (MLA).
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
@@ -468,11 +469,18 @@ class MLA(nn.Module):
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # Multi-head latent: split into per-head latents and shared position embeddings
+        kv, k_pe = torch.split(kv, [self.n_heads * self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv = kv.view(bsz, seqlen, self.n_heads, self.kv_lora_rank)
+        # Select only local heads for this rank
+        kv = kv[:, :, rank * self.n_local_heads:(rank + 1) * self.n_local_heads]
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
+            # Apply per-head normalization
+            kv_normed = torch.stack([self.kv_norm[h](kv[:, :, h]) for h in range(self.n_local_heads)], dim=2)
+            kv_normed = kv_normed.view(bsz, seqlen, -1)
+            kv = self.wkv_b(kv_normed)
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
@@ -483,13 +491,18 @@ class MLA(nn.Module):
             scores = torch.einsum("bshd,bthd->bsht", q, k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.n_heads * self.kv_lora_rank)
+            # Extract weight for each local head's latent dimension
+            wkv_b = wkv_b[:, :, rank * self.n_local_heads * self.kv_lora_rank:(rank + 1) * self.n_local_heads * self.kv_lora_rank]
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             kv_cache = self.kv_cache.clone()
             pe_cache = self.pe_cache.clone()
-            kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
+            # Apply per-head normalization before caching
+            kv_normed = torch.stack([self.kv_norm[h](kv[:, :, h]) for h in range(self.n_local_heads)], dim=2)
+            kv_cache[:bsz, start_pos:end_pos] = kv_normed
             pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            scores = (torch.einsum("bshc,btc->bsht", q_nope, kv_cache[:bsz, :end_pos]) +
+            scores = (torch.einsum("bshc,bthc->bsht", q_nope, kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, pe_cache[:bsz, :end_pos])) * self.softmax_scale
         if mask is not None:
             scores = scores + mask.unsqueeze(1)
@@ -497,7 +510,7 @@ class MLA(nn.Module):
         if attn_impl == "naive":
             x = torch.einsum("bsht,bthd->bshd", scores, v_cache[:bsz, :end_pos])
         else:
-            x = torch.einsum("bsht,btc->bshc", scores, kv_cache[:bsz, :end_pos])
+            x = torch.einsum("bsht,bthc->bshc", scores, kv_cache[:bsz, :end_pos])
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
         x = self.wo(x.flatten(2))
         return x
