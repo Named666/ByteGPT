@@ -7,14 +7,98 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from fp8_ops import act_quant, weight_dequant, fp8_gemm
+import deep_gemm
 
 
 world_size = 1
 rank = 0
 block_size = 128
-gemm_impl: Literal["bf16", "fp8"] = "bf16"
+gemm_impl: Literal["bf16", "fp8"] = "fp8"
 attn_impl: Literal["naive", "absorb"] = "absorb"
+
+def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantizes the input tensor `x` using block-wise quantization to FP8.
+
+    Args:
+        x (torch.Tensor): The input tensor to be quantized.
+        block_size (int, optional): The size of the blocks. Default is 128.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Quantized tensor (float8_e4m3fn) and scale (float32).
+    """
+    assert x.is_contiguous()
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    if x.dim() == 2 and x.size(0) % block_size == 0 and x.size(1) % block_size == 0:
+        # 2D block for square matrices like weight
+        M, N = x.size()
+        num_blocks_m = M // block_size
+        num_blocks_n = N // block_size
+        s = x.new_empty(num_blocks_m, num_blocks_n, dtype=torch.float32)
+        for i in range(num_blocks_m):
+            i_start = i * block_size
+            i_end = i_start + block_size
+            for j in range(num_blocks_n):
+                j_start = j * block_size
+                j_end = j_start + block_size
+                block = x[i_start:i_end, j_start:j_end]
+                scale = block.abs().max() / 448.0
+                y[i_start:i_end, j_start:j_end] = (block / scale).to(torch.float8_e4m3fn)
+                s[i, j] = scale
+    else:
+        # per last dim
+        assert x.size(-1) % block_size == 0
+        s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+        for i in range(0, x.size(-1), block_size):
+            block = x[..., i:i+block_size]
+            scale = block.abs().max() / 448.0
+            y[..., i:i+block_size] = (block / scale).to(torch.float8_e4m3fn)
+            s[..., i // block_size] = scale
+    return y, s
+
+def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    Dequantizes the weight tensor.
+    """
+    assert x.is_contiguous() and s.is_contiguous()
+    assert x.dim() == 2 and s.dim() == 2
+    M, N = x.size()
+    y = torch.empty_like(x, dtype=torch.float32)
+    for i in range(0, M, block_size):
+        for j in range(0, N, block_size):
+            block = x[i:i+block_size, j:j+block_size]
+            scale = s[i // block_size, j // block_size]
+            y[i:i+block_size, j:j+block_size] = block * scale
+    return y
+
+class FP8Linear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias):
+        ctx.original_shape = x.shape
+        x_flat = x.view(-1, x.size(-1)) if x.dim() > 2 else x
+        ctx.save_for_backward(x_flat, weight, bias)
+        weight_q, weight_scale = act_quant(weight, block_size)
+        x_q, x_scale = act_quant(x_flat, block_size)
+        M, K = x_q.shape
+        N = weight_q.shape[0]
+        y = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
+        deep_gemm.fp8_gemm_nt((x_q, x_scale), (weight_q, weight_scale), y)
+        if bias is not None:
+            y += bias
+        if x.dim() > 2:
+            y = y.view(x.shape[:-1] + (y.size(-1),))
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_flat, weight, bias = ctx.saved_tensors
+        grad_output_flat = grad_output.view(-1, grad_output.size(-1)) if grad_output.dim() > 2 else grad_output
+        # Use full precision for gradient computation
+        grad_x_flat = F.linear(grad_output_flat, weight.t())
+        grad_weight = F.linear(grad_output_flat.t(), x_flat).t()
+        grad_bias = grad_output_flat.sum(dim=0) if bias is not None else None
+        grad_x = grad_x_flat.view(ctx.original_shape)
+        return grad_x, grad_weight, grad_bias
 
 @dataclass
 class ModelArgs:
@@ -100,7 +184,7 @@ class ParallelEmbedding(nn.Module):
         self.part_vocab_size = (vocab_size // world_size)
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
-        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
         nn.init.uniform_(self.weight, -0.1, 0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -137,31 +221,20 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
 
     Args:
         x (torch.Tensor): The input tensor.
-        weight (torch.Tensor): The weight tensor. It may be quantized and 
-            requires dequantization for certain cases.
+        weight (torch.Tensor): The weight tensor.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
 
     Returns:
-        torch.Tensor: The result of the linear transformation, which may involve 
-        quantization-aware computations depending on the input parameters.
+        torch.Tensor: The result of the linear transformation.
 
     Notes:
-        - If `weight` is quantized (e.g., `element_size() > 1`), a dequantized version 
-          is used for computation.
-        - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
-        - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
+        - If `gemm_impl == "bf16"`, uses standard PyTorch linear.
+        - If `gemm_impl == "fp8"`, uses FP8 quantized operations with DeepGEMM.
     """
-    if weight.element_size() > 1:
-        return F.linear(x, weight, bias)
-    elif gemm_impl == "bf16":
-        weight = weight_dequant(weight, weight.scale)
+    if gemm_impl == "bf16":
         return F.linear(x, weight, bias)
     else:
-        x, scale = act_quant(x, block_size)
-        y = fp8_gemm(x, scale, weight, weight.scale)
-        if bias is not None:
-            y += bias
-        return y
+        return FP8Linear.apply(x, weight, bias)
 
 
 class Linear(nn.Module):
@@ -181,14 +254,9 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
-        if self.weight.element_size() == 1:
-            scale_out_features = (out_features + block_size - 1) // block_size
-            scale_in_features = (in_features + block_size - 1) // block_size
-            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
-        else:
-            self.register_parameter("scale", None)
+        self.register_parameter("scale", None)
         if bias:
-            self.bias = nn.Parameter(torch.empty(self.part_out_features))
+            self.bias = nn.Parameter(torch.empty(out_features, dtype=dtype or Linear.dtype))
         else:
             self.register_parameter("bias", None)
 
