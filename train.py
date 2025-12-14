@@ -61,33 +61,14 @@ def train(
         for i in range(0, len(data), batch_size):
             optimizer.zero_grad()
             batch, target = get_batch(data, i, batch_size)
-            #print("Batch Tokens : " , batch)
             target = target.to(torch.long).squeeze()
             logits = model.forward(batch)
+            logits = torch.clamp(logits, min=-1e4, max=1e4)
             next_token = sample(logits, temperature)
-            print(f"Next token : {next_token}")
-            #print(f"Model outputs: {logits}")
-            #print(f"Logits shape: {logits.shape}, Target shape: {target.shape}")
-            #print(logits.view(-1, logits.size(-1)), target.view(-1))
             loss = criterion(logits.view(-1, logits.size(-1)), target.view(-1))
-            print(f"Loss before backward: {loss.item()}")
             loss.backward()
-            print(loss)
-
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_norm = param.grad.data.norm(2)
-                    print(f"Gradient norm for {name}: {grad_norm}")
-
-            for name, param in model.named_parameters():
-                print(f"Parameter {name} before step: {param.data}")
-
-
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
-
-            for name, param in model.named_parameters():
-                print(f"Parameter {name} after step: {param.data}")
-            
             total_loss += loss.item()
             break
         
@@ -126,13 +107,17 @@ def main(
     global print
     if rank != 0:
         print = lambda *_, **__: None
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(torch.float32)
     torch.set_num_threads(8)
     torch.manual_seed(965)
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
     model = Transformer(args)
+    # Test forward
+    test_x = torch.randint(0, args.vocab_size, (2, 1))
+    test_out = model(test_x)
+    print(f"Test output shape: {test_out.shape}, has nan: {torch.isnan(test_out).any()}, has inf: {torch.isinf(test_out).any()}")
     checkpoint_path = os.path.join(ckpt_path, f"model.safetensors")
     if os.path.exists(checkpoint_path):
         load_model(model, checkpoint_path)

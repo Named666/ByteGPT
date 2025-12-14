@@ -106,14 +106,14 @@ def main(
     global print
     if rank != 0:
         print = lambda *_, **__: None
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(torch.float32)
     torch.set_num_threads(8)
     torch.manual_seed(965)
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
     model = Transformer(args)
-    checkpoint_path = os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
+    checkpoint_path = os.path.join(ckpt_path, f"model.safetensors")
     if os.path.exists(checkpoint_path):
         load_model(model, checkpoint_path)
         print("Loaded model from checkpoint.")
